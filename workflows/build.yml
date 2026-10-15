@@ -1,1 +1,589 @@
+name: Z-Download Pro APK
+on:
+  workflow_dispatch:
+  push:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Crear proyecto Z-Download Pro
+        run: |
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'ZEOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
 
+          android {
+              namespace = "com.zdownload.pro"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.zdownload.pro"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+                  ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+              }
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug") // instalable directo
+                  }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+              buildFeatures { compose = true }
+              packaging { jniLibs { useLegacyPackaging = true } }
+          }
+
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              // Motor yt-dlp (para actualizar yt-dlp, sube este número de versión)
+              implementation("io.github.junkfood02.youtubedl-android:library:0.17.2")
+              implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.17.2")
+          }
+          ZEOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'ZEOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="Z-Download Pro"
+                  android:icon="@drawable/ic_launcher"
+                  android:extractNativeLibs="true"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@style/Theme.Z">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <!-- Aparece en el menú "Compartir" de otras apps -->
+                      <intent-filter>
+                          <action android:name="android.intent.action.SEND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                          <data android:mimeType="text/plain" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".DownloadService"
+                      android:exported="false"
+                      android:foregroundServiceType="dataSync" />
+              </application>
+          </manifest>
+          ZEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/zdownload/pro/DownloadService.kt')"
+          cat > 'app/src/main/java/com/zdownload/pro/DownloadService.kt' <<'ZEOF'
+          package com.zdownload.pro
+
+          import android.app.*
+          import android.content.ContentValues
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Environment
+          import android.os.IBinder
+          import android.provider.MediaStore
+          import com.yausername.ffmpeg.FFmpeg
+          import com.yausername.youtubedl_android.YoutubeDL
+          import com.yausername.youtubedl_android.YoutubeDLRequest
+          import kotlinx.coroutines.*
+          import java.io.File
+          import java.util.UUID
+          import java.util.concurrent.ConcurrentHashMap
+
+          object Engine {
+              @Volatile private var ok = false
+              @Synchronized fun ensure(c: Context) {
+                  if (!ok) {
+                      YoutubeDL.getInstance().init(c.applicationContext)
+                      FFmpeg.getInstance().init(c.applicationContext)
+                      ok = true
+                  }
+              }
+          }
+
+          class DownloadService : Service() {
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+              private val jobs = ConcurrentHashMap<String, Job>()
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(
+                      NotificationChannel("dl", "Descargas", NotificationManager.IMPORTANCE_LOW)
+                  )
+              }
+
+              private fun notif(text: String) = Notification.Builder(this, "dl")
+                  .setContentTitle("Z-Download Pro")
+                  .setContentText(text)
+                  .setSmallIcon(android.R.drawable.stat_sys_download)
+                  .setOngoing(true)
+                  .build()
+
+              override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+                  startForeground(1, notif("Descargando…"))
+                  if (i?.action == "cancel") {
+                      i.getStringExtra("id")?.let { id ->
+                          Repo.update(id) { it.copy(status = Status.CANCELED, msg = "Cancelado") }
+                          runCatching { YoutubeDL.getInstance().destroyProcessById(id) }
+                          jobs.remove(id)?.cancel()
+                      }
+                  } else {
+                      val url = i?.getStringExtra("url")
+                      val fmt = i?.getStringExtra("fmt") ?: "best"
+                      if (url != null) {
+                          val id = UUID.randomUUID().toString()
+                          Repo.add(DlItem(id, url))
+                          jobs[id] = scope.launch { run(id, url, fmt); jobs.remove(id); finishIfIdle() }
+                      }
+                  }
+                  finishIfIdle()
+                  return START_NOT_STICKY
+              }
+
+              private fun finishIfIdle() {
+                  if (jobs.isEmpty()) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
+              }
+
+              private fun run(id: String, url: String, fmt: String) {
+                  val dir = File(cacheDir, "dl/$id").apply { mkdirs() }
+                  try {
+                      Engine.ensure(this)
+                      runCatching {
+                          val info = YoutubeDL.getInstance().getInfo(url)
+                          Repo.update(id) { it.copy(title = info.title ?: url) }
+                      }
+                      val req = YoutubeDLRequest(url).apply {
+                          addOption("-o", dir.absolutePath + "/%(title).80s.%(ext)s")
+                          addOption("--no-playlist")
+                          addOption("--restrict-filenames")
+                          when (fmt) {
+                              "audio" -> { addOption("-x"); addOption("--audio-format", "mp3") }
+                              "best" -> { addOption("-f", "bv*+ba/b"); addOption("--merge-output-format", "mp4") }
+                              else -> { addOption("-f", "bv*[height<=$fmt]+ba/b[height<=$fmt]"); addOption("--merge-output-format", "mp4") }
+                          }
+                      }
+                      YoutubeDL.getInstance().execute(req, id) { progress, eta, _ ->
+                          Repo.update(id) { it.copy(progress = progress / 100f, msg = if (eta > 0) "Faltan ${eta}s" else "") }
+                      }
+                      saveToDownloads(dir)
+                      Repo.update(id) { it.copy(progress = 1f, status = Status.DONE, msg = "Guardado en Descargas/Z-Download") }
+                  } catch (e: Exception) {
+                      Repo.update(id) {
+                          if (it.status == Status.RUNNING) it.copy(status = Status.ERROR, msg = e.message?.takeLast(140) ?: "Error")
+                          else it
+                      }
+                  } finally {
+                      dir.deleteRecursively()
+                  }
+              }
+
+              private fun saveToDownloads(dir: File) {
+                  dir.listFiles()?.filter { it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }?.forEach { f ->
+                      val mime = when (f.extension.lowercase()) {
+                          "mp3" -> "audio/mpeg"; "m4a" -> "audio/mp4"; "mp4" -> "video/mp4"
+                          "webm" -> "video/webm"; "mkv" -> "video/x-matroska"; else -> "application/octet-stream"
+                      }
+                      val cv = ContentValues().apply {
+                          put(MediaStore.Downloads.DISPLAY_NAME, f.name)
+                          put(MediaStore.Downloads.MIME_TYPE, mime)
+                          put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Z-Download")
+                      }
+                      val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv) ?: return@forEach
+                      contentResolver.openOutputStream(uri)?.use { o -> f.inputStream().use { it.copyTo(o) } }
+                  }
+              }
+
+              override fun onDestroy() { scope.cancel(); super.onDestroy() }
+          }
+          ZEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/zdownload/pro/MainActivity.kt')"
+          cat > 'app/src/main/java/com/zdownload/pro/MainActivity.kt' <<'ZEOF'
+          package com.zdownload.pro
+
+          import android.Manifest
+          import android.content.Intent
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.enableEdgeToEdge
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.BorderStroke
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.border
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.isSystemInDarkTheme
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.LazyRow
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.Close
+          import androidx.compose.material.icons.filled.Settings
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.lerp
+          import androidx.compose.ui.platform.LocalClipboardManager
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.TextStyle
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+
+          data class Palette(val name: String, val a: Color, val b: Color)
+
+          val palettes = listOf(
+              Palette("Aurora", Color(0xFF7F00FF), Color(0xFF00C6FF)),
+              Palette("Sunset", Color(0xFFFF512F), Color(0xFFDD2476)),
+              Palette("Ocean", Color(0xFF1C92D2), Color(0xFF00E5C3)),
+              Palette("Neón", Color(0xFF00F260), Color(0xFF0575E6)),
+              Palette("Fuego", Color(0xFFF7971E), Color(0xFFFF1E56)),
+              Palette("Royal", Color(0xFF8E2DE2), Color(0xFFF953C6))
+          )
+
+          enum class Mode(val label: String) { SYSTEM("Sistema"), LIGHT("Claro"), DARK("Oscuro") }
+
+          val qualities = listOf("best" to "Máx", "1080" to "1080p", "720" to "720p", "480" to "480p", "audio" to "MP3")
+
+          class MainActivity : ComponentActivity() {
+              private val shared = mutableStateOf<String?>(null)
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  enableEdgeToEdge()
+                  handle(intent)
+                  setContent { ZApp(shared) }
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  handle(intent)
+              }
+
+              private fun handle(i: Intent?) {
+                  if (i?.action == Intent.ACTION_SEND) {
+                      val text = i.getStringExtra(Intent.EXTRA_TEXT) ?: return
+                      Regex("https?://\\S+").find(text)?.value?.let { shared.value = it }
+                  }
+              }
+          }
+
+          @Composable
+          fun ZApp(shared: MutableState<String?>) {
+              val ctx = LocalContext.current
+              val prefs = remember { ctx.getSharedPreferences("z", 0) }
+              var mode by remember { mutableStateOf(Mode.valueOf(prefs.getString("mode", "SYSTEM")!!)) }
+              var palIdx by remember { mutableIntStateOf(prefs.getInt("pal", 0)) }
+              var quality by remember { mutableStateOf(prefs.getString("q", "best")!!) }
+              var showSettings by remember { mutableStateOf(false) }
+              var url by remember { mutableStateOf("") }
+              val items by Repo.items.collectAsState()
+              val clipboard = LocalClipboardManager.current
+
+              val dark = when (mode) { Mode.SYSTEM -> isSystemInDarkTheme(); Mode.LIGHT -> false; Mode.DARK -> true }
+              val p = palettes[palIdx]
+              val scheme = if (dark)
+                  darkColorScheme(primary = p.a, secondary = p.b, surface = Color(0xFF16161F), onSurface = Color.White)
+              else
+                  lightColorScheme(primary = p.a, secondary = p.b, surface = Color.White, onSurface = Color(0xFF1A1A1A))
+
+              val notifPerm = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+              LaunchedEffect(Unit) {
+                  if (Build.VERSION.SDK_INT >= 33) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
+              }
+
+              // Descarga directa al compartir desde otras apps
+              LaunchedEffect(shared.value) {
+                  shared.value?.let {
+                      startDownload(ctx, it, quality)
+                      Toast.makeText(ctx, "Descarga iniciada", Toast.LENGTH_SHORT).show()
+                      shared.value = null
+                  }
+              }
+
+              MaterialTheme(colorScheme = scheme) {
+                  val bg = Brush.verticalGradient(
+                      if (dark) listOf(lerp(p.a, Color.Black, .82f), lerp(p.b, Color.Black, .88f))
+                      else listOf(lerp(p.a, Color.White, .86f), lerp(p.b, Color.White, .86f))
+                  )
+                  Box(Modifier.fillMaxSize().background(bg)) {
+                      Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(16.dp)) {
+                          Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                              Text(
+                                  "Z-Download Pro",
+                                  modifier = Modifier.weight(1f),
+                                  style = TextStyle(
+                                      brush = Brush.linearGradient(listOf(p.a, p.b)),
+                                      fontSize = 28.sp, fontWeight = FontWeight.ExtraBold
+                                  )
+                              )
+                              IconButton(onClick = { showSettings = true }) {
+                                  Icon(Icons.Default.Settings, "Ajustes", tint = MaterialTheme.colorScheme.onSurface)
+                              }
+                          }
+                          Spacer(Modifier.height(12.dp))
+
+                          Card(
+                              shape = RoundedCornerShape(24.dp),
+                              colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = .8f))
+                          ) {
+                              Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                  OutlinedTextField(
+                                      value = url, onValueChange = { url = it },
+                                      modifier = Modifier.fillMaxWidth(),
+                                      placeholder = { Text("Pega el enlace del video") },
+                                      singleLine = true, shape = RoundedCornerShape(16.dp),
+                                      trailingIcon = {
+                                          TextButton(onClick = { clipboard.getText()?.text?.let { url = it.trim() } }) { Text("Pegar") }
+                                      }
+                                  )
+                                  LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                      items(qualities) { (key, label) ->
+                                          FilterChip(
+                                              selected = quality == key,
+                                              onClick = { quality = key; prefs.edit().putString("q", key).apply() },
+                                              label = { Text(label) }
+                                          )
+                                      }
+                                  }
+                                  GradBtn("Descargar", p) {
+                                      val u = Regex("https?://\\S+").find(url)?.value
+                                      if (u == null) Toast.makeText(ctx, "Enlace no válido", Toast.LENGTH_SHORT).show()
+                                      else { startDownload(ctx, u, quality); url = "" }
+                                  }
+                              }
+                          }
+
+                          Spacer(Modifier.height(16.dp))
+                          Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                              Text("Descargas", Modifier.weight(1f), fontWeight = FontWeight.Bold,
+                                  fontSize = 18.sp, color = MaterialTheme.colorScheme.onSurface)
+                              TextButton(onClick = { Repo.clearFinished() }) { Text("Limpiar") }
+                          }
+
+                          if (items.isEmpty()) {
+                              Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                                  Text("Pega un enlace o usa Compartir desde cualquier app",
+                                      color = MaterialTheme.colorScheme.onSurface.copy(alpha = .6f))
+                              }
+                          } else {
+                              LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                                  items(items, key = { it.id }) { DlCard(it, p) }
+                              }
+                          }
+                      }
+                  }
+
+                  if (showSettings) {
+                      AlertDialog(
+                          onDismissRequest = { showSettings = false },
+                          confirmButton = { TextButton(onClick = { showSettings = false }) { Text("Listo") } },
+                          title = { Text("Apariencia") },
+                          text = {
+                              Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                                  Text("Tema")
+                                  Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                      Mode.values().forEach { m ->
+                                          FilterChip(
+                                              selected = mode == m,
+                                              onClick = { mode = m; prefs.edit().putString("mode", m.name).apply() },
+                                              label = { Text(m.label) }
+                                          )
+                                      }
+                                  }
+                                  Text("Degradado")
+                                  LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                      items(palettes.size) { i ->
+                                          val pl = palettes[i]
+                                          Box(
+                                              Modifier.size(44.dp).clip(CircleShape)
+                                                  .background(Brush.linearGradient(listOf(pl.a, pl.b)))
+                                                  .then(if (i == palIdx) Modifier.border(3.dp, MaterialTheme.colorScheme.onSurface, CircleShape) else Modifier)
+                                                  .clickable { palIdx = i; prefs.edit().putInt("pal", i).apply() }
+                                          )
+                                      }
+                                  }
+                              }
+                          }
+                      )
+                  }
+              }
+          }
+
+          @Composable
+          fun GradBtn(text: String, p: Palette, onClick: () -> Unit) {
+              Box(
+                  Modifier.fillMaxWidth().height(52.dp).clip(RoundedCornerShape(16.dp))
+                      .background(Brush.horizontalGradient(listOf(p.a, p.b))).clickable(onClick = onClick),
+                  contentAlignment = Alignment.Center
+              ) { Text(text, color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp) }
+          }
+
+          @Composable
+          fun DlCard(d: DlItem, p: Palette) {
+              val ctx = LocalContext.current
+              Card(
+                  shape = RoundedCornerShape(20.dp),
+                  colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = .8f)),
+                  border = BorderStroke(1.dp, Brush.linearGradient(listOf(p.a.copy(alpha = .6f), p.b.copy(alpha = .6f))))
+              ) {
+                  Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                      Row(verticalAlignment = Alignment.CenterVertically) {
+                          Text(d.title, Modifier.weight(1f), maxLines = 2, fontWeight = FontWeight.SemiBold,
+                              color = MaterialTheme.colorScheme.onSurface)
+                          IconButton(onClick = {
+                              if (d.status == Status.RUNNING) cancelDownload(ctx, d.id) else Repo.remove(d.id)
+                          }) { Icon(Icons.Default.Close, "Cerrar", tint = MaterialTheme.colorScheme.onSurface) }
+                      }
+                      if (d.status == Status.RUNNING) {
+                          if (d.progress <= 0f) LinearProgressIndicator(Modifier.fillMaxWidth(), color = p.a)
+                          else LinearProgressIndicator(progress = { d.progress }, modifier = Modifier.fillMaxWidth(), color = p.a)
+                      }
+                      val label = when (d.status) {
+                          Status.RUNNING -> "${(d.progress * 100).toInt()}% ${d.msg}"
+                          Status.DONE -> "✅ ${d.msg}"
+                          Status.ERROR -> "⚠️ ${d.msg}"
+                          Status.CANCELED -> "Cancelado"
+                      }
+                      Text(label, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .7f))
+                  }
+              }
+          }
+          ZEOF
+          mkdir -p "$(dirname 'app/src/main/java/com/zdownload/pro/Repo.kt')"
+          cat > 'app/src/main/java/com/zdownload/pro/Repo.kt' <<'ZEOF'
+          package com.zdownload.pro
+
+          import android.content.Context
+          import android.content.Intent
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.flow.MutableStateFlow
+          import kotlinx.coroutines.flow.update
+
+          enum class Status { RUNNING, DONE, ERROR, CANCELED }
+
+          data class DlItem(
+              val id: String,
+              val url: String,
+              val title: String = "Analizando…",
+              val progress: Float = 0f,
+              val status: Status = Status.RUNNING,
+              val msg: String = ""
+          )
+
+          object Repo {
+              val items = MutableStateFlow<List<DlItem>>(emptyList())
+              fun add(i: DlItem) = items.update { listOf(i) + it }
+              fun update(id: String, f: (DlItem) -> DlItem) =
+                  items.update { l -> l.map { if (it.id == id) f(it) else it } }
+              fun remove(id: String) = items.update { l -> l.filter { it.id != id } }
+              fun clearFinished() = items.update { l -> l.filter { it.status == Status.RUNNING } }
+          }
+
+          fun startDownload(c: Context, url: String, fmt: String) {
+              ContextCompat.startForegroundService(
+                  c, Intent(c, DownloadService::class.java).putExtra("url", url).putExtra("fmt", fmt)
+              )
+          }
+
+          fun cancelDownload(c: Context, id: String) {
+              c.startService(Intent(c, DownloadService::class.java).setAction("cancel").putExtra("id", id))
+          }
+          ZEOF
+          mkdir -p "$(dirname 'app/src/main/res/drawable/ic_launcher.xml')"
+          cat > 'app/src/main/res/drawable/ic_launcher.xml' <<'ZEOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:aapt="http://schemas.android.com/aapt"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:pathData="M0,0h108v108h-108z">
+                  <aapt:attr name="android:fillColor">
+                      <gradient android:startX="0" android:startY="0" android:endX="108" android:endY="108"
+                          android:startColor="#7F00FF" android:endColor="#00C6FF" />
+                  </aapt:attr>
+              </path>
+              <path android:fillColor="#FFFFFF" android:pathData="M48,28h12v26h10L54,72 38,54h10z" />
+              <path android:fillColor="#FFFFFF" android:pathData="M36,78h36v6h-36z" />
+          </vector>
+          ZEOF
+          mkdir -p "$(dirname 'app/src/main/res/values/themes.xml')"
+          cat > 'app/src/main/res/values/themes.xml' <<'ZEOF'
+          <resources>
+              <style name="Theme.Z" parent="android:Theme.Material.NoActionBar">
+                  <item name="android:windowBackground">@android:color/black</item>
+              </style>
+          </resources>
+          ZEOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'ZEOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          ZEOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'ZEOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g
+          ZEOF
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'ZEOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "ZDownloadPro"
+          include(":app")
+          ZEOF
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Compilar APK
+        run: gradle assembleRelease --no-daemon
+      - name: Renombrar APK
+        run: cp app/build/outputs/apk/release/*.apk Z-Download-Pro.apk
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Z-Download Pro (build ${{ github.run_number }})
+          files: Z-Download-Pro.apk
