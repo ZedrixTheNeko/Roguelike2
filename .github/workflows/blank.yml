@@ -53,9 +53,10 @@ jobs:
               implementation("androidx.activity:activity-compose:1.9.2")
               implementation("androidx.core:core-ktx:1.13.1")
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              implementation("io.coil-kt:coil-compose:2.7.0")
               // Motor yt-dlp (para actualizar yt-dlp, sube este número de versión)
-              implementation("io.github.junkfood02.youtubedl-android:library:0.17.2")
-              implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.17.2")
+              implementation("io.github.junkfood02.youtubedl-android:library:0.18.1")
+              implementation("io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1")
           }
           ZEOF
           mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
@@ -105,6 +106,7 @@ jobs:
           import android.content.ContentValues
           import android.content.Context
           import android.content.Intent
+          import android.net.Uri
           import android.os.Environment
           import android.os.IBinder
           import android.provider.MediaStore
@@ -112,18 +114,95 @@ jobs:
           import com.yausername.youtubedl_android.YoutubeDL
           import com.yausername.youtubedl_android.YoutubeDLRequest
           import kotlinx.coroutines.*
+          import org.json.JSONObject
           import java.io.File
           import java.util.UUID
           import java.util.concurrent.ConcurrentHashMap
 
           object Engine {
               @Volatile private var ok = false
-              @Synchronized fun ensure(c: Context) {
+
+              @Synchronized
+              fun ensure(c: Context) {
                   if (!ok) {
                       YoutubeDL.getInstance().init(c.applicationContext)
-                      FFmpeg.getInstance().init(c.applicationContext)
+                      runCatching { FFmpeg.getInstance().init(c.applicationContext) }
                       ok = true
                   }
+                  // Actualiza yt-dlp (las plataformas cambian seguido) como máximo cada 12 horas
+                  val prefs = c.getSharedPreferences("z", 0)
+                  val now = System.currentTimeMillis()
+                  if (now - prefs.getLong("upd", 0L) > 12 * 3600_000L) {
+                      if (updateYtDlp(c)) prefs.edit().putLong("upd", now).apply()
+                  }
+              }
+
+              private fun findChannel(t: Class<*>): Any? {
+                  for (n in listOf("NIGHTLY", "STABLE")) {
+                      runCatching { t.getField(n).get(null)?.let { return it } }
+                      runCatching { t.getField("_$n").get(null)?.let { return it } }
+                      runCatching {
+                          val comp = t.getField("Companion").get(null)!!
+                          comp.javaClass.methods.firstOrNull {
+                              it.parameterCount == 0 && it.name.lowercase().contains(n.lowercase())
+                          }?.invoke(comp)?.let { return it }
+                      }
+                      runCatching {
+                          t.declaredClasses.firstOrNull { it.simpleName.trimStart('_').equals(n, true) }
+                              ?.getField("INSTANCE")?.get(null)?.let { return it }
+                      }
+                      runCatching {
+                          t.enumConstants?.firstOrNull { it.toString().contains(n, true) }?.let { return it }
+                      }
+                  }
+                  return null
+              }
+
+              private fun updateYtDlp(c: Context): Boolean = try {
+                  val y = YoutubeDL.getInstance()
+                  val m = y.javaClass.methods.first { it.name == "updateYoutubeDL" && it.parameterTypes.size == 2 }
+                  val ch = findChannel(m.parameterTypes[1])
+                  if (ch == null) false else { m.invoke(y, c.applicationContext, ch); true }
+              } catch (e: Throwable) { false }
+
+              /** Intentos: normal y, para YouTube, clientes alternativos que no necesitan JS */
+              fun attempts(url: String): List<String?> =
+                  if (url.contains("youtu")) listOf(null, "youtube:player_client=android_vr", "youtube:player_client=tv")
+                  else listOf(null)
+
+              private fun JSONObject.str(k: String): String? = if (isNull(k)) null else optString(k).ifBlank { null }
+
+              fun fetchInfo(c: Context, url: String): VInfo {
+                  ensure(c)
+                  var last: Exception? = null
+                  for (a in attempts(url)) {
+                      try {
+                          val req = YoutubeDLRequest(url).apply {
+                              addOption("--dump-single-json")
+                              addOption("--no-playlist")
+                              addOption("--skip-download")
+                              addOption("--no-warnings")
+                              addOption("--socket-timeout", "20")
+                              if (a != null) addOption("--extractor-args", a)
+                          }
+                          val out = YoutubeDL.getInstance().execute(req, null, null).out
+                          val j = JSONObject(out.substring(out.indexOf('{')))
+                          val hs = sortedSetOf<Int>()
+                          j.optJSONArray("formats")?.let { fm ->
+                              for (i in 0 until fm.length()) {
+                                  val f = fm.getJSONObject(i)
+                                  val h = f.optInt("height", 0)
+                                  val vc = f.str("vcodec") ?: "none"
+                                  if (h >= 144 && vc != "none") hs.add(h)
+                              }
+                          }
+                          return VInfo(
+                              url, j.str("title") ?: url, j.str("thumbnail"),
+                              j.optLong("duration", 0L), j.str("uploader") ?: "", hs.toList().sortedDescending()
+                          )
+                      } catch (e: Exception) { last = e }
+                  }
+                  throw last ?: Exception("Error desconocido")
               }
           }
 
@@ -157,10 +236,10 @@ jobs:
                       }
                   } else {
                       val url = i?.getStringExtra("url")
-                      val fmt = i?.getStringExtra("fmt") ?: "best"
+                      val fmt = i?.getStringExtra("fmt") ?: "480"
                       if (url != null) {
                           val id = UUID.randomUUID().toString()
-                          Repo.add(DlItem(id, url))
+                          Repo.add(DlItem(id, url, i.getStringExtra("title") ?: DEFAULT_TITLE, i.getStringExtra("thumb")))
                           jobs[id] = scope.launch { run(id, url, fmt); jobs.remove(id); finishIfIdle() }
                       }
                   }
@@ -172,53 +251,101 @@ jobs:
                   if (jobs.isEmpty()) { stopForeground(STOP_FOREGROUND_REMOVE); stopSelf() }
               }
 
+              private fun buildRequest(url: String, dir: File, fmt: String, attempt: String?) =
+                  YoutubeDLRequest(url).apply {
+                      addOption("-o", dir.absolutePath + "/%(title).80s.%(ext)s")
+                      addOption("--no-playlist")
+                      addOption("--windows-filenames")
+                      addOption("--no-mtime")
+                      addOption("--retries", "5")
+                      addOption("--socket-timeout", "20")
+                      if (attempt != null) addOption("--extractor-args", attempt)
+                      when (fmt) {
+                          "audio" -> { addOption("-f", "ba/b"); addOption("-x"); addOption("--audio-format", "mp3") }
+                          "best" -> {
+                              addOption("-f", "bv*+ba/b")
+                              addOption("-S", "res,vcodec:h264,acodec:aac")
+                              addOption("--merge-output-format", "mp4")
+                          }
+                          else -> {
+                              addOption("-f", "bv*[height<=$fmt]+ba/b[height<=$fmt]/b")
+                              addOption("-S", "res,vcodec:h264,acodec:aac")
+                              addOption("--merge-output-format", "mp4")
+                          }
+                      }
+                  }
+
               private fun run(id: String, url: String, fmt: String) {
                   val dir = File(cacheDir, "dl/$id").apply { mkdirs() }
                   try {
                       Engine.ensure(this)
-                      runCatching {
-                          val info = YoutubeDL.getInstance().getInfo(url)
-                          Repo.update(id) { it.copy(title = info.title ?: url) }
-                      }
-                      val req = YoutubeDLRequest(url).apply {
-                          addOption("-o", dir.absolutePath + "/%(title).80s.%(ext)s")
-                          addOption("--no-playlist")
-                          addOption("--restrict-filenames")
-                          when (fmt) {
-                              "audio" -> { addOption("-x"); addOption("--audio-format", "mp3") }
-                              "best" -> { addOption("-f", "bv*+ba/b"); addOption("--merge-output-format", "mp4") }
-                              else -> { addOption("-f", "bv*[height<=$fmt]+ba/b[height<=$fmt]"); addOption("--merge-output-format", "mp4") }
+                      var last: Exception? = null
+                      var done = false
+                      for (a in Engine.attempts(url)) {
+                          if (Repo.isCanceled(id)) return
+                          try {
+                              YoutubeDL.getInstance().execute(buildRequest(url, dir, fmt, a), id) { p, eta, line ->
+                                  Repo.update(id) { cur ->
+                                      var t = cur.title
+                                      if (t == DEFAULT_TITLE && line.contains("Destination:")) {
+                                          t = line.substringAfter("Destination:").trim()
+                                              .substringAfterLast('/').substringBeforeLast('.')
+                                      }
+                                      cur.copy(
+                                          title = t,
+                                          progress = (p.coerceAtLeast(0f) / 100f).coerceAtMost(1f),
+                                          msg = when {
+                                              p >= 99.9f -> "Procesando…"
+                                              p <= 0f -> "Preparando…"
+                                              eta > 0 -> "Faltan ${eta}s"
+                                              else -> ""
+                                          }
+                                      )
+                                  }
+                              }
+                              done = true
+                              break
+                          } catch (e: Exception) {
+                              if (Repo.isCanceled(id)) return
+                              last = e
+                              dir.listFiles()?.forEach { it.delete() }
                           }
                       }
-                      YoutubeDL.getInstance().execute(req, id) { progress, eta, _ ->
-                          Repo.update(id) { it.copy(progress = progress / 100f, msg = if (eta > 0) "Faltan ${eta}s" else "") }
+                      if (!done) throw last ?: Exception("Error desconocido")
+                      val saved = saveToDownloads(dir)
+                      Repo.update(id) {
+                          it.copy(
+                              progress = 1f, status = Status.DONE, msg = "Listo · toca para abrir · Descargas/Z-Download",
+                              uri = saved?.first?.toString(), mime = saved?.second
+                          )
                       }
-                      saveToDownloads(dir)
-                      Repo.update(id) { it.copy(progress = 1f, status = Status.DONE, msg = "Guardado en Descargas/Z-Download") }
                   } catch (e: Exception) {
                       Repo.update(id) {
-                          if (it.status == Status.RUNNING) it.copy(status = Status.ERROR, msg = e.message?.takeLast(140) ?: "Error")
-                          else it
+                          if (it.status == Status.RUNNING) it.copy(status = Status.ERROR, msg = cleanErr(e.message)) else it
                       }
                   } finally {
                       dir.deleteRecursively()
                   }
               }
 
-              private fun saveToDownloads(dir: File) {
-                  dir.listFiles()?.filter { it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }?.forEach { f ->
-                      val mime = when (f.extension.lowercase()) {
-                          "mp3" -> "audio/mpeg"; "m4a" -> "audio/mp4"; "mp4" -> "video/mp4"
-                          "webm" -> "video/webm"; "mkv" -> "video/x-matroska"; else -> "application/octet-stream"
+              private fun saveToDownloads(dir: File): Pair<Uri, String>? {
+                  var result: Pair<Uri, String>? = null
+                  dir.listFiles()?.filter { it.isFile && !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }
+                      ?.sortedBy { it.length() }?.forEach { f ->
+                          val mime = when (f.extension.lowercase()) {
+                              "mp3" -> "audio/mpeg"; "m4a" -> "audio/mp4"; "mp4" -> "video/mp4"
+                              "webm" -> "video/webm"; "mkv" -> "video/x-matroska"; else -> "application/octet-stream"
+                          }
+                          val cv = ContentValues().apply {
+                              put(MediaStore.Downloads.DISPLAY_NAME, f.name)
+                              put(MediaStore.Downloads.MIME_TYPE, mime)
+                              put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Z-Download")
+                          }
+                          val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv) ?: return@forEach
+                          contentResolver.openOutputStream(uri)?.use { o -> f.inputStream().use { it.copyTo(o) } }
+                          result = uri to mime
                       }
-                      val cv = ContentValues().apply {
-                          put(MediaStore.Downloads.DISPLAY_NAME, f.name)
-                          put(MediaStore.Downloads.MIME_TYPE, mime)
-                          put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Z-Download")
-                      }
-                      val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv) ?: return@forEach
-                      contentResolver.openOutputStream(uri)?.use { o -> f.inputStream().use { it.copyTo(o) } }
-                  }
+                  return result
               }
 
               override fun onDestroy() { scope.cancel(); super.onDestroy() }
@@ -229,7 +356,9 @@ jobs:
           package com.zdownload.pro
 
           import android.Manifest
+          import android.content.Context
           import android.content.Intent
+          import android.net.Uri
           import android.os.Build
           import android.os.Bundle
           import android.widget.Toast
@@ -247,8 +376,10 @@ jobs:
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.LazyRow
           import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
           import androidx.compose.foundation.shape.CircleShape
           import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.verticalScroll
           import androidx.compose.material.icons.Icons
           import androidx.compose.material.icons.filled.Close
           import androidx.compose.material.icons.filled.Settings
@@ -260,12 +391,17 @@ jobs:
           import androidx.compose.ui.graphics.Brush
           import androidx.compose.ui.graphics.Color
           import androidx.compose.ui.graphics.lerp
+          import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.platform.LocalClipboardManager
           import androidx.compose.ui.platform.LocalContext
           import androidx.compose.ui.text.TextStyle
           import androidx.compose.ui.text.font.FontWeight
           import androidx.compose.ui.unit.dp
           import androidx.compose.ui.unit.sp
+          import coil.compose.AsyncImage
+          import kotlinx.coroutines.CancellationException
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.withContext
 
           data class Palette(val name: String, val a: Color, val b: Color)
 
@@ -280,7 +416,7 @@ jobs:
 
           enum class Mode(val label: String) { SYSTEM("Sistema"), LIGHT("Claro"), DARK("Oscuro") }
 
-          val qualities = listOf("best" to "Máx", "1080" to "1080p", "720" to "720p", "480" to "480p", "audio" to "MP3")
+          val autoQualities = listOf("360", "480", "720", "1080", "best", "audio")
 
           class MainActivity : ComponentActivity() {
               private val shared = mutableStateOf<String?>(null)
@@ -289,6 +425,8 @@ jobs:
                   super.onCreate(savedInstanceState)
                   enableEdgeToEdge()
                   handle(intent)
+                  // Prepara el motor en segundo plano
+                  Thread { runCatching { Engine.ensure(applicationContext) } }.start()
                   setContent { ZApp(shared) }
               }
 
@@ -305,15 +443,42 @@ jobs:
               }
           }
 
+          fun fmtDuration(s: Long): String {
+              if (s <= 0) return ""
+              val h = s / 3600; val m = (s % 3600) / 60; val sec = s % 60
+              return if (h > 0) "%d:%02d:%02d".format(h, m, sec) else "%d:%02d".format(m, sec)
+          }
+
+          fun heightTag(h: Int) = when {
+              h >= 2160 -> "4K"; h >= 1440 -> "2K"; h >= 1080 -> "FULL HD"; h >= 720 -> "HD"; else -> ""
+          }
+
+          fun openFile(c: Context, d: DlItem) {
+              try {
+                  c.startActivity(
+                      Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(d.uri), d.mime)
+                          .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  )
+              } catch (e: Exception) {
+                  Toast.makeText(c, "No se pudo abrir. Búscalo en Descargas/Z-Download", Toast.LENGTH_LONG).show()
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
           @Composable
           fun ZApp(shared: MutableState<String?>) {
               val ctx = LocalContext.current
               val prefs = remember { ctx.getSharedPreferences("z", 0) }
               var mode by remember { mutableStateOf(Mode.valueOf(prefs.getString("mode", "SYSTEM")!!)) }
               var palIdx by remember { mutableIntStateOf(prefs.getInt("pal", 0)) }
-              var quality by remember { mutableStateOf(prefs.getString("q", "best")!!) }
+              var autoQ by remember { mutableStateOf(prefs.getString("q", "480")!!) }
+              var auto by remember { mutableStateOf(prefs.getBoolean("auto", false)) }
               var showSettings by remember { mutableStateOf(false) }
               var url by remember { mutableStateOf("") }
+              var sheetUrl by remember { mutableStateOf<String?>(null) }
+              var info by remember { mutableStateOf<VInfo?>(null) }
+              var infoErr by remember { mutableStateOf<String?>(null) }
+              var retry by remember { mutableIntStateOf(0) }
               val items by Repo.items.collectAsState()
               val clipboard = LocalClipboardManager.current
 
@@ -329,12 +494,29 @@ jobs:
                   if (Build.VERSION.SDK_INT >= 33) notifPerm.launch(Manifest.permission.POST_NOTIFICATIONS)
               }
 
-              // Descarga directa al compartir desde otras apps
+              fun onLink(u: String) {
+                  if (auto) {
+                      startDownload(ctx, u, autoQ)
+                      Toast.makeText(ctx, "Descargando en ${qLabel(autoQ)}", Toast.LENGTH_SHORT).show()
+                  } else {
+                      sheetUrl = u
+                  }
+              }
+
               LaunchedEffect(shared.value) {
-                  shared.value?.let {
-                      startDownload(ctx, it, quality)
-                      Toast.makeText(ctx, "Descarga iniciada", Toast.LENGTH_SHORT).show()
-                      shared.value = null
+                  shared.value?.let { onLink(it); shared.value = null }
+              }
+
+              // Analiza el enlace cuando se abre la ventana de resoluciones
+              LaunchedEffect(sheetUrl, retry) {
+                  val u = sheetUrl ?: return@LaunchedEffect
+                  info = null; infoErr = null
+                  try {
+                      info = withContext(Dispatchers.IO) { Engine.fetchInfo(ctx, u) }
+                  } catch (e: CancellationException) {
+                      throw e
+                  } catch (e: Exception) {
+                      infoErr = cleanErr(e.message)
                   }
               }
 
@@ -347,8 +529,7 @@ jobs:
                       Column(Modifier.fillMaxSize().statusBarsPadding().navigationBarsPadding().padding(16.dp)) {
                           Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                               Text(
-                                  "Z-Download Pro",
-                                  modifier = Modifier.weight(1f),
+                                  "Z-Download Pro", Modifier.weight(1f),
                                   style = TextStyle(
                                       brush = Brush.linearGradient(listOf(p.a, p.b)),
                                       fontSize = 28.sp, fontWeight = FontWeight.ExtraBold
@@ -374,19 +555,15 @@ jobs:
                                           TextButton(onClick = { clipboard.getText()?.text?.let { url = it.trim() } }) { Text("Pegar") }
                                       }
                                   )
-                                  LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                      items(qualities) { (key, label) ->
-                                          FilterChip(
-                                              selected = quality == key,
-                                              onClick = { quality = key; prefs.edit().putString("q", key).apply() },
-                                              label = { Text(label) }
-                                          )
-                                      }
-                                  }
+                                  Text(
+                                      if (auto) "⚡ Automático · ${qLabel(autoQ)}  (cambiar)" else "🎞 Elegir resolución al descargar  (cambiar)",
+                                      fontSize = 13.sp, color = p.a, fontWeight = FontWeight.SemiBold,
+                                      modifier = Modifier.clickable { showSettings = true }
+                                  )
                                   GradBtn("Descargar", p) {
                                       val u = Regex("https?://\\S+").find(url)?.value
                                       if (u == null) Toast.makeText(ctx, "Enlace no válido", Toast.LENGTH_SHORT).show()
-                                      else { startDownload(ctx, u, quality); url = "" }
+                                      else { onLink(u); url = "" }
                                   }
                               }
                           }
@@ -411,14 +588,88 @@ jobs:
                       }
                   }
 
+                  // ---- Ventana de resoluciones (estilo Snaptube) ----
+                  sheetUrl?.let { u ->
+                      ModalBottomSheet(
+                          onDismissRequest = { sheetUrl = null },
+                          sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+                          containerColor = MaterialTheme.colorScheme.surface
+                      ) {
+                          Column(
+                              Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
+                                  .navigationBarsPadding().padding(horizontal = 16.dp, vertical = 8.dp),
+                              verticalArrangement = Arrangement.spacedBy(10.dp)
+                          ) {
+                              val inf = info
+                              if (infoErr != null) {
+                                  Text("No se pudo analizar el enlace", fontWeight = FontWeight.Bold, fontSize = 18.sp)
+                                  Text(infoErr!!, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .75f))
+                                  GradBtn("Reintentar", p) { retry++ }
+                                  OutlinedButton(
+                                      onClick = { startDownload(ctx, u, "480"); sheetUrl = null },
+                                      modifier = Modifier.fillMaxWidth()
+                                  ) { Text("Intentar descargar igual (480p)") }
+                              } else if (inf == null) {
+                                  Row(Modifier.fillMaxWidth().padding(vertical = 32.dp),
+                                      horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                                      CircularProgressIndicator(color = p.a, modifier = Modifier.size(28.dp))
+                                      Spacer(Modifier.width(14.dp))
+                                      Text("Analizando enlace…")
+                                  }
+                              } else {
+                                  Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                                      if (inf.thumb != null) {
+                                          AsyncImage(
+                                              model = inf.thumb, contentDescription = null, contentScale = ContentScale.Crop,
+                                              modifier = Modifier.width(128.dp).height(72.dp).clip(RoundedCornerShape(12.dp))
+                                          )
+                                      }
+                                      Column(Modifier.weight(1f)) {
+                                          Text(inf.title, maxLines = 2, fontWeight = FontWeight.Bold)
+                                          val sub = listOf(inf.uploader, fmtDuration(inf.duration)).filter { it.isNotEmpty() }.joinToString(" · ")
+                                          if (sub.isNotEmpty()) Text(sub, fontSize = 12.sp,
+                                              color = MaterialTheme.colorScheme.onSurface.copy(alpha = .65f))
+                                      }
+                                  }
+                                  Text("Elige la resolución", fontWeight = FontWeight.SemiBold)
+                                  fun pick(fmt: String) { startDownload(ctx, u, fmt, inf.title, inf.thumb); sheetUrl = null
+                                      Toast.makeText(ctx, "Descarga iniciada", Toast.LENGTH_SHORT).show() }
+                                  OptionRow("⭐", "Mejor calidad disponible", "", p) { pick("best") }
+                                  inf.heights.forEach { h -> OptionRow("🎬", "${h}p", heightTag(h), p) { pick(h.toString()) } }
+                                  OptionRow("🎵", "Solo audio (MP3)", "", p) { pick("audio") }
+                              }
+                              Spacer(Modifier.height(12.dp))
+                          }
+                      }
+                  }
+
                   if (showSettings) {
                       AlertDialog(
                           onDismissRequest = { showSettings = false },
                           confirmButton = { TextButton(onClick = { showSettings = false }) { Text("Listo") } },
-                          title = { Text("Apariencia") },
+                          title = { Text("Ajustes") },
                           text = {
-                              Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                                  Text("Tema")
+                              Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                                  Text("Descarga", fontWeight = FontWeight.Bold)
+                                  Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Column(Modifier.weight(1f)) {
+                                          Text("Descarga automática")
+                                          Text(if (auto) "Descarga directo con la calidad elegida" else "Te muestro las resoluciones",
+                                              fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .65f))
+                                      }
+                                      Switch(checked = auto, onCheckedChange = { auto = it; prefs.edit().putBoolean("auto", it).apply() })
+                                  }
+                                  Text("Calidad automática")
+                                  LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                      items(autoQualities) { q ->
+                                          FilterChip(
+                                              selected = autoQ == q,
+                                              onClick = { autoQ = q; prefs.edit().putString("q", q).apply() },
+                                              label = { Text(qLabel(q)) }
+                                          )
+                                      }
+                                  }
+                                  Text("Tema", fontWeight = FontWeight.Bold)
                                   Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                       Mode.values().forEach { m ->
                                           FilterChip(
@@ -428,7 +679,7 @@ jobs:
                                           )
                                       }
                                   }
-                                  Text("Degradado")
+                                  Text("Degradado", fontWeight = FontWeight.Bold)
                                   LazyRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                       items(palettes.size) { i ->
                                           val pl = palettes[i]
@@ -448,6 +699,26 @@ jobs:
           }
 
           @Composable
+          fun OptionRow(icon: String, title: String, tag: String, p: Palette, onClick: () -> Unit) {
+              val shape = RoundedCornerShape(16.dp)
+              Row(
+                  Modifier.fillMaxWidth().clip(shape)
+                      .border(1.dp, Brush.horizontalGradient(listOf(p.a.copy(alpha = .7f), p.b.copy(alpha = .7f))), shape)
+                      .clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  Text(icon, fontSize = 20.sp)
+                  Spacer(Modifier.width(12.dp))
+                  Text(title, Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
+                  if (tag.isNotEmpty()) {
+                      Text(tag, color = p.a, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                      Spacer(Modifier.width(10.dp))
+                  }
+                  Text("⬇", fontSize = 18.sp)
+              }
+          }
+
+          @Composable
           fun GradBtn(text: String, p: Palette, onClick: () -> Unit) {
               Box(
                   Modifier.fillMaxWidth().height(52.dp).clip(RoundedCornerShape(16.dp))
@@ -460,29 +731,35 @@ jobs:
           fun DlCard(d: DlItem, p: Palette) {
               val ctx = LocalContext.current
               Card(
+                  modifier = Modifier.clickable(enabled = d.status == Status.DONE && d.uri != null) { openFile(ctx, d) },
                   shape = RoundedCornerShape(20.dp),
                   colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = .8f)),
                   border = BorderStroke(1.dp, Brush.linearGradient(listOf(p.a.copy(alpha = .6f), p.b.copy(alpha = .6f))))
               ) {
-                  Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                      Row(verticalAlignment = Alignment.CenterVertically) {
-                          Text(d.title, Modifier.weight(1f), maxLines = 2, fontWeight = FontWeight.SemiBold,
-                              color = MaterialTheme.colorScheme.onSurface)
-                          IconButton(onClick = {
-                              if (d.status == Status.RUNNING) cancelDownload(ctx, d.id) else Repo.remove(d.id)
-                          }) { Icon(Icons.Default.Close, "Cerrar", tint = MaterialTheme.colorScheme.onSurface) }
+                  Row(Modifier.padding(12.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.Top) {
+                      if (d.thumb != null) {
+                          AsyncImage(
+                              model = d.thumb, contentDescription = null, contentScale = ContentScale.Crop,
+                              modifier = Modifier.width(96.dp).height(60.dp).clip(RoundedCornerShape(10.dp))
+                          )
                       }
-                      if (d.status == Status.RUNNING) {
-                          if (d.progress <= 0f) LinearProgressIndicator(Modifier.fillMaxWidth(), color = p.a)
-                          else LinearProgressIndicator(progress = { d.progress }, modifier = Modifier.fillMaxWidth(), color = p.a)
+                      Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                          Text(d.title, maxLines = 2, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.onSurface)
+                          if (d.status == Status.RUNNING) {
+                              if (d.progress <= 0f) LinearProgressIndicator(Modifier.fillMaxWidth(), color = p.a)
+                              else LinearProgressIndicator(progress = { d.progress }, modifier = Modifier.fillMaxWidth(), color = p.a)
+                          }
+                          val label = when (d.status) {
+                              Status.RUNNING -> if (d.progress > 0f) "${(d.progress * 100).toInt()}% · ${d.msg}" else d.msg
+                              Status.DONE -> "✅ ${d.msg}"
+                              Status.ERROR -> "⚠️ ${d.msg}"
+                              Status.CANCELED -> "Cancelado"
+                          }
+                          Text(label, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .7f))
                       }
-                      val label = when (d.status) {
-                          Status.RUNNING -> "${(d.progress * 100).toInt()}% ${d.msg}"
-                          Status.DONE -> "✅ ${d.msg}"
-                          Status.ERROR -> "⚠️ ${d.msg}"
-                          Status.CANCELED -> "Cancelado"
-                      }
-                      Text(label, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurface.copy(alpha = .7f))
+                      IconButton(onClick = {
+                          if (d.status == Status.RUNNING) cancelDownload(ctx, d.id) else Repo.remove(d.id)
+                      }) { Icon(Icons.Default.Close, "Cerrar", tint = MaterialTheme.colorScheme.onSurface) }
                   }
               }
           }
@@ -499,13 +776,27 @@ jobs:
 
           enum class Status { RUNNING, DONE, ERROR, CANCELED }
 
+          const val DEFAULT_TITLE = "Obteniendo información…"
+
           data class DlItem(
               val id: String,
               val url: String,
-              val title: String = "Analizando…",
+              val title: String = DEFAULT_TITLE,
+              val thumb: String? = null,
               val progress: Float = 0f,
               val status: Status = Status.RUNNING,
-              val msg: String = ""
+              val msg: String = "",
+              val uri: String? = null,
+              val mime: String? = null
+          )
+
+          data class VInfo(
+              val url: String,
+              val title: String,
+              val thumb: String?,
+              val duration: Long,
+              val uploader: String,
+              val heights: List<Int>
           )
 
           object Repo {
@@ -515,17 +806,36 @@ jobs:
                   items.update { l -> l.map { if (it.id == id) f(it) else it } }
               fun remove(id: String) = items.update { l -> l.filter { it.id != id } }
               fun clearFinished() = items.update { l -> l.filter { it.status == Status.RUNNING } }
+              fun isCanceled(id: String) = items.value.firstOrNull { it.id == id }?.status == Status.CANCELED
           }
 
-          fun startDownload(c: Context, url: String, fmt: String) {
+          fun startDownload(c: Context, url: String, fmt: String, title: String? = null, thumb: String? = null) {
               ContextCompat.startForegroundService(
-                  c, Intent(c, DownloadService::class.java).putExtra("url", url).putExtra("fmt", fmt)
+                  c, Intent(c, DownloadService::class.java)
+                      .putExtra("url", url).putExtra("fmt", fmt)
+                      .putExtra("title", title).putExtra("thumb", thumb)
               )
           }
 
           fun cancelDownload(c: Context, id: String) {
               c.startService(Intent(c, DownloadService::class.java).setAction("cancel").putExtra("id", id))
           }
+
+          fun cleanErr(m: String?): String {
+              val lines = (m ?: "").lines().map { it.trim() }.filter { it.isNotEmpty() }
+              val line = lines.lastOrNull { it.startsWith("ERROR") } ?: lines.lastOrNull() ?: "Error desconocido"
+              val l = line.lowercase()
+              return when {
+                  "403" in l -> "La plataforma bloqueó la descarga (403). Prueba otra calidad o inténtalo más tarde."
+                  "sign in to confirm" in l -> "La plataforma pide verificar que no eres un bot. Inténtalo más tarde."
+                  "unable to resolve" in l || "timed out" in l || "network is unreachable" in l -> "Sin conexión a internet."
+                  "unsupported url" in l -> "Enlace no compatible."
+                  "private" in l -> "El video es privado."
+                  else -> line.removePrefix("ERROR:").trim().replace(Regex("https?://\\S+"), "[enlace]").take(160)
+              }
+          }
+
+          fun qLabel(q: String) = when (q) { "best" -> "Máx"; "audio" -> "MP3"; else -> "${q}p" }
           ZEOF
           mkdir -p "$(dirname 'app/src/main/res/drawable/ic_launcher.xml')"
           cat > 'app/src/main/res/drawable/ic_launcher.xml' <<'ZEOF'
